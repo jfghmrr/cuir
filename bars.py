@@ -15,6 +15,35 @@ def normalize_topic(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip().casefold()
 
 
+_RUSSIAN_MONTHS_SHORT = {
+    "янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5,
+    "июн": 6, "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12,
+}
+
+
+def _excel_date_key(date_hint: str) -> str:
+    """Нормализует Excel-дату вида '14 Мая' → 'DD.MM' ('14.05'). Возвращает '' если не парсится."""
+    if not date_hint:
+        return ""
+    m = re.match(r"(\d+)\s+(\S+)", date_hint.strip().lower())
+    if not m:
+        return ""
+    day = int(m.group(1))
+    month_word = m.group(2)
+    for stem, num in _RUSSIAN_MONTHS_SHORT.items():
+        if month_word.startswith(stem):
+            return f"{day:02d}.{num:02d}"
+    return ""
+
+
+def _bars_date_key(modal_title: str) -> str:
+    """Из '14.05.2026 11:30 - Васильева...' извлекает 'DD.MM' ('14.05')."""
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.\d{4}", modal_title or "")
+    if not m:
+        return ""
+    return f"{int(m.group(1)):02d}.{int(m.group(2)):02d}"
+
+
 @dataclass
 class FillResult:
     topic: str
@@ -286,6 +315,14 @@ class BarsClient:
             new_hw = (l.homework or "").strip()
             if not prev_hw and new_hw:
                 targets[key] = l
+
+        # Доп. индекс: дата (DD.MM) → список уроков. Используется как fallback,
+        # если тема в БАРС читается чуть-чуть иначе, чем в Excel.
+        by_date: dict[str, list[Lesson]] = {}
+        for l in schedule.lessons:
+            dkey = _excel_date_key(l.date_hint)
+            if dkey:
+                by_date.setdefault(dkey, []).append(l)
         already_done: set[str] = set()
 
         headers = self._lesson_column_headers()
@@ -318,6 +355,25 @@ class BarsClient:
             self.log(f"  [колонка {idx}] тема в БАРС: {topic[:80]!r}")
             key = normalize_topic(topic)
             lesson = targets.get(key)
+
+            # Date-fallback: если тема не нашлась, но есть уникальный урок Excel
+            # на эту же дату с непустым ДЗ — используем его.
+            if lesson is None:
+                bars_dkey = self._read_lesson_modal_date()
+                if bars_dkey:
+                    candidates = [
+                        c for c in by_date.get(bars_dkey, [])
+                        if (c.homework or "").strip()
+                        and normalize_topic(c.topic) not in already_done
+                    ]
+                    if len(candidates) == 1:
+                        lesson = candidates[0]
+                        key = normalize_topic(lesson.topic)
+                        self.log(
+                            f"    match по дате {bars_dkey} → "
+                            f"Excel-тема: {lesson.topic[:60]!r}"
+                        )
+
             if lesson is None:
                 if not topic:
                     self.log("    тема пустая (нет привязки к КТП) → пропуск")
@@ -482,6 +538,33 @@ class BarsClient:
             except Exception:
                 continue
 
+    def _read_lesson_modal_date(self) -> str:
+        """Возвращает 'DD.MM' из заголовка модалки '14.05.2026 11:30 - ...'.
+        Пустую строку — если не нашли.
+        """
+        assert self.page is not None
+        page = self.page
+        try:
+            # Заголовок модалки — h-элемент с датой; ищем первое вхождение DD.MM.YYYY HH:MM.
+            loc = page.locator(
+                ":text-matches('\\\\d{1,2}\\\\.\\\\d{1,2}\\\\.\\\\d{4}\\\\s+\\\\d{1,2}:\\\\d{2}', '')"
+            )
+            count = loc.count()
+            for i in range(min(count, 5)):
+                el = loc.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    txt = (el.text_content() or "").strip()
+                except Exception:
+                    continue
+                key = _bars_date_key(txt)
+                if key:
+                    return key
+        except Exception:
+            pass
+        return ""
+
     def _goto_lesson_tab(self) -> None:
         """Переключиться на вкладку «Урок» в карточке урока (она же по умолчанию первая)."""
         assert self.page is not None
@@ -548,7 +631,7 @@ class BarsClient:
         except Exception:
             pass
 
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + 5.0
         while True:
             topic = self._extract_topic_once()
             if topic:
