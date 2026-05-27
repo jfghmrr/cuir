@@ -814,8 +814,16 @@ class BarsClient:
             except Exception:
                 return False
 
-        # Перепроверка: реально ли стоит галочка после клика.
-        page.wait_for_timeout(200)
+        # БАРС асинхронно сохраняет состояние после клика. Если не подождать —
+        # последующий клик по другой вкладке может уйти в пустоту, и кнопка
+        # «Добавить основное задание» не появится.
+        page.wait_for_timeout(800)
+        try:
+            page.wait_for_load_state("networkidle", timeout=5_000)
+        except PWTimeout:
+            pass
+        # Дополнительная пауза на отрисовку UI после save.
+        page.wait_for_timeout(300)
         try:
             return checkbox.first.is_checked()
         except Exception:
@@ -875,17 +883,17 @@ class BarsClient:
             pass
         return True
 
-    def _find_add_homework_button(self):
-        """Ищет кнопку «Добавить основное задание» с поллингом до 5 секунд.
+    def _find_add_homework_button(self, max_wait_s: float = 8.0):
+        """Ищет кнопку «Добавить основное задание» с поллингом до max_wait_s.
 
         Возвращает (locator_element | None). None означает, что кнопки нет
-        (ДЗ уже есть или вкладка не загрузилась совсем).
+        (ДЗ уже есть, или редактор показан inline без кнопки, или вкладка
+        не загрузилась совсем).
         """
         assert self.page is not None
         page = self.page
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + max_wait_s
         while True:
-            # Сначала ищем внутри видимого tabpanel (скоуп), потом глобально.
             for loc in (
                 page.locator("[role='tabpanel']:visible").last.get_by_role(
                     "button", name="Добавить основное задание", exact=True
@@ -904,8 +912,61 @@ class BarsClient:
             except Exception:
                 return None
 
+    def _find_inline_homework_editor(self):
+        """Ищет inline-редактор ДЗ ТОЛЬКО по явной метке (без fallback'а на
+        случайный contenteditable — иначе можно зацепить редактор темы).
+
+        Возвращает (element | None).
+        """
+        assert self.page is not None
+        page = self.page
+        label_re = re.compile(
+            r"Основное\s+задание|^Задание\s+на\s+следующий|^Домашнее\s+задание",
+            re.IGNORECASE,
+        )
+        try:
+            loc = page.get_by_label(label_re)
+            for el in loc.all():
+                try:
+                    if el.is_visible():
+                        return el
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
+    def _ensure_tab_active(self, tab_name: str, max_wait_s: float = 5.0) -> bool:
+        """Гарантирует, что вкладка с именем tab_name стала активной (aria-selected=true).
+
+        Если БАРС в момент клика занят AJAX-save (после tick'а чекбокса),
+        первый клик может проигнорироваться. Делаем до 3 попыток.
+        """
+        assert self.page is not None
+        page = self.page
+        tab = page.get_by_role("tab", name=tab_name, exact=True)
+        if tab.count() == 0:
+            return False
+        deadline = time.monotonic() + max_wait_s
+        attempts = 0
+        while time.monotonic() < deadline:
+            try:
+                aria = tab.first.get_attribute("aria-selected")
+                if aria == "true":
+                    return True
+            except Exception:
+                pass
+            if attempts < 3:
+                try:
+                    tab.first.click()
+                    attempts += 1
+                except Exception:
+                    pass
+            page.wait_for_timeout(400)
+        return False
+
     def _log_tab_buttons(self) -> None:
-        """Диагностика: какие кнопки видны на странице (для отладки «кнопка не найдена»)."""
+        """Диагностика: что видно на странице, когда кнопка не найдена."""
         assert self.page is not None
         page = self.page
         try:
@@ -917,41 +978,104 @@ class BarsClient:
                         visible_texts.append((btn.text_content() or "").strip()[:60])
                 except Exception:
                     pass
-            self.log(f"    [diag] видимые кнопки: {visible_texts[:10]}")
+            self.log(f"    [diag] видимые кнопки: {visible_texts[:15]}")
         except Exception:
             pass
+        # Какая вкладка активна?
+        try:
+            active_tabs = page.locator("[role='tab'][aria-selected='true']:visible").all()
+            for t in active_tabs[:3]:
+                try:
+                    txt = (t.text_content() or "").strip()[:60]
+                    self.log(f"    [diag] активная вкладка: {txt!r}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Что в активной tabpanel?
+        try:
+            panel = page.locator("[role='tabpanel']:visible").last
+            txt = (panel.text_content() or "").strip().replace("\n", " ")[:200]
+            self.log(f"    [diag] текст в tabpanel: {txt!r}")
+        except Exception:
+            pass
+        # Скриншот для оффлайн-диагностики.
+        try:
+            shot_path = config.PROJECT_ROOT / f"diag_no_button_{int(time.time())}.png"
+            page.screenshot(path=str(shot_path), full_page=False)
+            self.log(f"    [diag] скриншот сохранён: {shot_path}")
+        except Exception as exc:
+            self.log(f"    [diag] не удалось сохранить скриншот: {exc}")
 
     def _add_next_lesson_homework(self, homework: str) -> tuple[str, str]:
         """Переключает на вкладку «Задание на следующий урок» и добавляет ДЗ.
 
-        Идемпотентность: если кнопка «Добавить основное задание» disabled или
-        не найдена за 5 с — задание уже есть (или вкладка не загрузилась).
+        Две модели UI:
+          A. БАРС показывает inline-редактор (contenteditable) сразу — заполняем.
+          B. БАРС требует клик «Добавить основное задание» — открываем диалог,
+             заполняем, сохраняем дочерний диалог.
+
         Закрытие модалки урока — снаружи, через _save_and_close_lesson().
         """
         assert self.page is not None
         page = self.page
 
-        # Кликаем по вкладке. Проверяем, что она существует.
-        hw_tab = page.get_by_role("tab", name="Задание на следующий урок", exact=True)
-        if hw_tab.count() == 0:
-            self.log("    [diag] вкладка «Задание на следующий урок» не найдена")
+        if not self._ensure_tab_active("Задание на следующий урок", max_wait_s=8.0):
+            self.log("    [diag] не удалось активировать вкладку «Задание на следующий урок»")
             self._log_tab_buttons()
-            return "skipped_existing", "вкладка ДЗ не найдена"
-        hw_tab.first.click()
-        # Явное ожидание после клика: вкладка рендерится асинхронно.
+            return "skipped_existing", "вкладка ДЗ не активировалась"
+        # Вкладка активна — ждём отрисовку контента.
         page.wait_for_timeout(600)
         try:
             page.wait_for_load_state("networkidle", timeout=5_000)
         except PWTimeout:
             pass
 
-        # Ищем кнопку «Добавить основное задание» с поллингом до 5 секунд.
+        # Сначала пробуем модель A — inline-редактор. Если в нём уже есть текст,
+        # считаем что ДЗ есть; иначе — заполняем.
+        inline = self._find_inline_homework_editor()
+        if inline is not None:
+            try:
+                existing = (inline.text_content() or "").strip()
+            except Exception:
+                existing = ""
+            if existing:
+                return "skipped_existing", f"ДЗ уже введено inline: {existing[:40]!r}"
+            if self.dry_run:
+                self.log(f"    [DRY] would fill inline editor: {homework!r}")
+                return "filled", f"[DRY] would fill: {homework!r}"
+            try:
+                inline.click()
+                page.wait_for_timeout(150)
+                try:
+                    inline.evaluate(
+                        "el => { "
+                        "if ('value' in el) { el.value = ''; } "
+                        "else { el.innerHTML = ''; } "
+                        "el.dispatchEvent(new InputEvent('input', {bubbles: true})); "
+                        "}"
+                    )
+                except Exception:
+                    pass
+                page.keyboard.type(homework)
+                try:
+                    inline.evaluate(
+                        "el => el.dispatchEvent(new InputEvent('input', {bubbles: true}))"
+                    )
+                except Exception:
+                    pass
+                page.wait_for_timeout(400)
+                return "filled", "inline editor"
+            except Exception as exc:
+                self.log(f"    ! не удалось заполнить inline editor: {exc}")
+                # Падаем дальше — может, кнопка «Добавить» доступна.
+
+        # Модель B — ищем кнопку «Добавить основное задание» до 8 секунд.
         add_btn = self._find_add_homework_button()
         if add_btn is None:
             self._log_tab_buttons()
-            return "skipped_existing", "ДЗ уже есть (кнопка добавления не появилась за 5 с)"
+            return "skipped_existing", "ДЗ уже есть (нет ни inline-редактора, ни кнопки)"
 
-        # Если кнопка disabled — БАРС не даст добавить (есть КТП или уже было).
         if self._is_button_disabled(add_btn):
             return "skipped_existing", "ДЗ уже есть (кнопка добавления неактивна)"
 
