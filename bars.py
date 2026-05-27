@@ -913,56 +913,135 @@ class BarsClient:
                 return None
 
     def _find_inline_homework_editor(self):
-        """Ищет inline-редактор ДЗ ТОЛЬКО по явной метке (без fallback'а на
-        случайный contenteditable — иначе можно зацепить редактор темы).
+        """Ищет inline-редактор ДЗ по метке. Возвращает ТОЛЬКО реальные поля
+        (input/textarea/contenteditable), а не form-item-обёртку с кнопкой.
 
         Возвращает (element | None).
         """
         assert self.page is not None
         page = self.page
         label_re = re.compile(
-            r"Основное\s+задание|^Задание\s+на\s+следующий|^Домашнее\s+задание",
+            r"^Основное\s+задание$|^Задание\s+на\s+следующий\s+урок$|^Домашнее\s+задание$",
             re.IGNORECASE,
         )
         try:
             loc = page.get_by_label(label_re)
             for el in loc.all():
                 try:
-                    if el.is_visible():
+                    if not el.is_visible():
+                        continue
+                    info = el.evaluate(
+                        "el => ({"
+                        "tag: el.tagName, "
+                        "editable: el.getAttribute && el.getAttribute('contenteditable')"
+                        "})"
+                    )
+                    tag = (info.get("tag") or "").upper()
+                    editable = (info.get("editable") or "").lower()
+                    if tag in ("INPUT", "TEXTAREA"):
                         return el
+                    if editable in ("true", "plaintext-only"):
+                        return el
+                    # Иначе это div-обёртка form-item — пропускаем.
                 except Exception:
                     pass
         except Exception:
             pass
         return None
 
-    def _ensure_tab_active(self, tab_name: str, max_wait_s: float = 5.0) -> bool:
-        """Гарантирует, что вкладка с именем tab_name стала активной (aria-selected=true).
+    def _dismiss_save_changes_dialog(self) -> bool:
+        """Закрывает диалог «Данные были изменены. Сохранить изменения?» через «Да».
 
-        Если БАРС в момент клика занят AJAX-save (после tick'а чекбокса),
-        первый клик может проигнорироваться. Делаем до 3 попыток.
+        БАРС показывает этот диалог при попытке покинуть вкладку с
+        несохранёнными изменениями (например, после tick'а чекбокса).
+        Жмём «Да» — БАРС сохраняет и продолжает.
         """
         assert self.page is not None
         page = self.page
-        tab = page.get_by_role("tab", name=tab_name, exact=True)
+        try:
+            marker = page.get_by_text(
+                re.compile(r"данные\s+были\s+изменены|сохранить\s+изменения", re.IGNORECASE)
+            )
+            if marker.count() == 0 or not marker.first.is_visible():
+                return False
+        except Exception:
+            return False
+        try:
+            yes_btn = page.get_by_role("button", name="Да", exact=True)
+            if yes_btn.count() > 0 and yes_btn.first.is_visible():
+                yes_btn.first.click()
+                page.wait_for_timeout(500)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5_000)
+                except PWTimeout:
+                    pass
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _switch_to_homework_tab(self, max_wait_s: float = 10.0) -> bool:
+        """Переключает на вкладку «Задание на следующий урок».
+
+        Проверка по КОНТЕНТУ (а не aria-selected): вкладка считается
+        переключённой, если видна кнопка «Добавить основное задание» или
+        inline-редактор. По пути обрабатываем диалог «Сохранить изменения?».
+
+        Возвращает True если контент вкладки реально виден.
+        """
+        assert self.page is not None
+        page = self.page
+
+        tab = page.get_by_role("tab", name="Задание на следующий урок", exact=True)
         if tab.count() == 0:
             return False
-        deadline = time.monotonic() + max_wait_s
-        attempts = 0
-        while time.monotonic() < deadline:
+
+        def _content_visible() -> bool:
             try:
-                aria = tab.first.get_attribute("aria-selected")
-                if aria == "true":
+                btn = page.get_by_role(
+                    "button", name="Добавить основное задание", exact=True
+                )
+                if btn.count() > 0 and btn.first.is_visible():
                     return True
             except Exception:
                 pass
-            if attempts < 3:
+            try:
+                lbl = page.get_by_label(
+                    re.compile(r"^Основное\s+задание$", re.IGNORECASE)
+                )
+                for el in lbl.all():
+                    try:
+                        if el.is_visible():
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return False
+
+        # Первый клик.
+        try:
+            tab.first.click()
+        except Exception:
+            pass
+
+        deadline = time.monotonic() + max_wait_s
+        clicks = 1
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(400)
+            # Диалог «Сохранить изменения?» — сразу закрываем через «Да».
+            if self._dismiss_save_changes_dialog():
+                page.wait_for_timeout(300)
+            if _content_visible():
+                return True
+            # Если контент не появился — попробуем кликнуть ещё раз (макс. 3).
+            if clicks < 3:
                 try:
                     tab.first.click()
-                    attempts += 1
+                    clicks += 1
                 except Exception:
                     pass
-            page.wait_for_timeout(400)
+
         return False
 
     def _log_tab_buttons(self) -> None:
@@ -1020,14 +1099,13 @@ class BarsClient:
         assert self.page is not None
         page = self.page
 
-        if not self._ensure_tab_active("Задание на следующий урок", max_wait_s=8.0):
-            self.log("    [diag] не удалось активировать вкладку «Задание на следующий урок»")
+        if not self._switch_to_homework_tab(max_wait_s=10.0):
+            self.log("    [diag] не удалось переключиться на вкладку ДЗ")
             self._log_tab_buttons()
-            return "skipped_existing", "вкладка ДЗ не активировалась"
-        # Вкладка активна — ждём отрисовку контента.
-        page.wait_for_timeout(600)
+            return "skipped_existing", "вкладка ДЗ не переключилась"
+        # Содержимое вкладки уже видно (проверено в _switch_to_homework_tab).
         try:
-            page.wait_for_load_state("networkidle", timeout=5_000)
+            page.wait_for_load_state("networkidle", timeout=3_000)
         except PWTimeout:
             pass
 
@@ -1252,7 +1330,9 @@ class BarsClient:
             self._close_lesson_modal()
             return True
 
-        pattern = re.compile(r"сохранить.*и.*закры", re.IGNORECASE)
+        # БАРС-кнопка может называться «Сохранить и закрыть урок»,
+        # «Сохранить и выйти» и т.п. — матчим всё.
+        pattern = re.compile(r"сохранить.*и.*(закры|выйти)", re.IGNORECASE)
         deadline = time.monotonic() + 3.0
         btn_first = None
         while time.monotonic() < deadline:
@@ -1269,8 +1349,11 @@ class BarsClient:
         try:
             btn_first.click()
         except Exception as exc:
-            self.log(f"    ! не удалось «Сохранить и закрыть»: {exc}")
+            self.log(f"    ! не удалось «Сохранить и выйти»: {exc}")
             return False
+        # Диалог «Сохранить изменения?» может появиться при сохранении.
+        page.wait_for_timeout(500)
+        self._dismiss_save_changes_dialog()
         try:
             page.wait_for_load_state("networkidle", timeout=8_000)
         except PWTimeout:
