@@ -138,7 +138,8 @@ class BarsClient:
         except PWTimeout:
             pass
         # Журнал догружается асинхронно — даём ему отрисовать таблицу.
-        page.wait_for_timeout(2_000)
+        # Основное ожидание — в _lesson_column_headers (до 20 с).
+        page.wait_for_timeout(3_000)
 
     def _dismiss_intro_modals(self) -> None:
         """Закрывает приветственные модалки БАРС («У вас есть непрочитанные сообщения» и т.п.)."""
@@ -211,7 +212,7 @@ class BarsClient:
             try:
                 field.fill("")
                 field.type(option, delay=20)
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(1_200)  # ждём фильтрацию dropdown
             except Exception:
                 pass
             if not self._click_option_in_dropdown(option):
@@ -343,7 +344,8 @@ class BarsClient:
 
         for idx in range(len(headers)):
             # перечитываем headers каждый раз — DOM пересоздаётся после открытия модалки
-            current = self._lesson_column_headers()
+            # _lesson_column_headers_once — без ожидания, журнал уже загружен
+            current = self._lesson_column_headers_once()
             if idx >= len(current):
                 break
             try:
@@ -478,45 +480,81 @@ class BarsClient:
     # Пока — best-guess по скриншотам.
 
     # Текст заголовка колонки-урока: «14.01\n14:50», «29.01 12:20» и т.п.
-    # \s* — между датой и временем может быть перевод строки или пробелы.
-    _DATE_HEADER_RE = re.compile(r"\d{1,2}\.\d{1,2}\s*\d{1,2}:\d{2}")
-    _DATE_HEADER_STRICT_RE = re.compile(r"^\s*\d{1,2}\.\d{1,2}\s*\d{1,2}:\d{2}\s*$")
+    # Не анкорим (без ^ и $), т.к. заголовок может содержать лишний текст.
+    _DATE_HEADER_RE = re.compile(r"\d{1,2}\.\d{1,2}[\s\S]{0,5}\d{1,2}:\d{2}")
 
-    def _lesson_column_headers(self):
+    def _lesson_column_headers(self, max_wait_s: float = 20.0) -> list:
+        """Возвращает видимые заголовки колонок-уроков, ожидая до max_wait_s секунд
+        пока журнал загружается после выбора комбобоксов."""
+        assert self.page is not None
+        page = self.page
+
+        deadline = time.monotonic() + max_wait_s
+        logged_wait = False
+        while True:
+            result = self._lesson_column_headers_once()
+            if result:
+                return result
+            if time.monotonic() >= deadline:
+                break
+            if not logged_wait:
+                logged_wait = True
+                self.log("  [ожидание] журнал загружается, жду до 20 секунд...")
+            try:
+                page.wait_for_timeout(800)
+            except Exception:
+                break
+
+        # Ничего не нашли — диагностика.
+        self._dump_journal_diagnostics()
+        return []
+
+    def _lesson_column_headers_once(self) -> list:
+        """Один проход поиска заголовков (без ожидания). Возвращает [] если не найдено."""
         assert self.page is not None
         page = self.page
 
         strategies = [
             # 1. <th> или role=columnheader (стандартные таблицы)
             lambda: page.locator("th, [role='columnheader']").filter(
-                has_text=self._DATE_HEADER_STRICT_RE
+                has_text=self._DATE_HEADER_RE
             ),
-            # 2. ExtJS / VueJS журналы: ячейки с классом *header* / *date*
+            # 2. ExtJS / VueJS журналы: ячейки с классом *header* / *date* / *column*
             lambda: page.locator(
                 "[class*='header'], [class*='Header'], [class*='date'], "
                 "[class*='column'], .x-grid-cell-inner, .x-column-header-inner"
-            ).filter(has_text=self._DATE_HEADER_STRICT_RE),
-            # 3. Любой элемент, у которого ВЕСЬ текст совпадает с шаблоном (с переносом строки)
-            lambda: page.get_by_text(self._DATE_HEADER_STRICT_RE),
+            ).filter(has_text=self._DATE_HEADER_RE),
+            # 3. Любой div/span/td/th, содержащий паттерн дата+время
+            lambda: page.locator("div, span, td, th").filter(
+                has_text=self._DATE_HEADER_RE
+            ),
         ]
 
+        seen_keys: set[str] = set()
         for build in strategies:
             try:
                 loc = build()
                 visible = []
                 for el in loc.all():
                     try:
-                        if el.is_visible():
-                            visible.append(el)
+                        if not el.is_visible():
+                            continue
+                        txt = (el.text_content() or "").strip()
+                        if not self._DATE_HEADER_RE.search(txt):
+                            continue
+                        # Дедупликация по первым 20 символам текста
+                        key = txt[:20]
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        visible.append(el)
                     except Exception:
                         continue
                 if visible:
                     return visible
-            except Exception as exc:
-                self.log(f"  [diag] стратегия поиска заголовков не сработала: {exc}")
+            except Exception:
+                continue
 
-        # Если ничего не нашли — диагностика: что есть на странице.
-        self._dump_journal_diagnostics()
         return []
 
     def _dump_journal_diagnostics(self) -> None:
@@ -524,25 +562,53 @@ class BarsClient:
         assert self.page is not None
         page = self.page
         try:
-            # Любой видимый элемент, в тексте которого есть "DD.MM ... HH:MM"
-            elements = page.locator(":text-matches('\\\\d{1,2}\\\\.\\\\d{1,2}.*\\\\d{1,2}:\\\\d{2}', '')").all()
+            self.log(f"  [diag] URL страницы: {page.url!r}")
         except Exception:
-            elements = []
-        self.log(f"  [diag] всего узлов с подстрокой даты-времени: {len(elements)}")
-        shown = 0
-        for el in elements:
-            try:
-                if not el.is_visible():
+            pass
+        # Элементы <th>
+        try:
+            ths = page.locator("th").all()
+            self.log(f"  [diag] элементов <th>: {len(ths)}")
+            for th in ths[:8]:
+                try:
+                    text = (th.text_content() or "").strip().replace("\n", " ")[:60]
+                    self.log(f"    <th> {text!r}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # role=columnheader
+        try:
+            chs = page.get_by_role("columnheader").all()
+            self.log(f"  [diag] role=columnheader: {len(chs)}")
+            for ch in chs[:5]:
+                try:
+                    text = (ch.text_content() or "").strip().replace("\n", " ")[:60]
+                    self.log(f"    columnheader: {text!r}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Любой видимый элемент с «DD.MM»
+        try:
+            elements = page.locator(":text-matches('\\d{1,2}\\.\\d{1,2}', '')").all()
+            self.log(f"  [diag] элементов с «DD.MM»: {len(elements)}")
+            shown = 0
+            for el in elements:
+                try:
+                    if not el.is_visible():
+                        continue
+                    tag = (el.evaluate("el => el.tagName") or "?").lower()
+                    cls = el.evaluate("el => el.className") or ""
+                    text = (el.text_content() or "").strip().replace("\n", " ")[:80]
+                    self.log(f"  [diag] <{tag} class={cls!r}> '{text}'")
+                    shown += 1
+                    if shown >= 10:
+                        break
+                except Exception:
                     continue
-                tag = (el.evaluate("el => el.tagName") or "?").lower()
-                cls = el.evaluate("el => el.className") or ""
-                text = (el.text_content() or "").strip().replace("\n", " ")[:80]
-                self.log(f"  [diag] <{tag} class={cls!r}> '{text}'")
-                shown += 1
-                if shown >= 10:
-                    break
-            except Exception:
-                continue
+        except Exception:
+            pass
 
     def _read_lesson_modal_date(self) -> str:
         """Возвращает 'DD.MM' из заголовка модалки '14.05.2026 11:30 - ...'.

@@ -201,7 +201,26 @@ class App(tk.Tk):
             schedule.klass = self.klass_var.get().strip() or schedule.klass
             schedule.subject = self.subject_var.get().strip() or schedule.subject
             schedule.group = self.group_var.get().strip() or schedule.group
-            schedule.period = self.period_var.get().strip() or schedule.period
+
+            # Период: если пользователь ввёл четверть (например «4 четверть»),
+            # БАРС покажет только уроки той четверти, а Excel почти всегда содержит
+            # всё полугодие → большинство уроков уйдёт в not_found. Автоматически
+            # расширяем до полугодия (которое угадал парсер по датам Excel).
+            user_period = self.period_var.get().strip()
+            guessed = schedule.period  # _guess_period: «1 Полугодие» или «2 Полугодие»
+            if not user_period:
+                schedule.period = guessed
+            elif "четверт" in user_period.lower():
+                self._log(
+                    f"Период {user_period!r} заменён на {guessed!r} — БАРС с фильтром "
+                    "по четверти не покажет все уроки Excel.",
+                    "warn",
+                )
+                schedule.period = guessed
+            else:
+                schedule.period = user_period
+            # Синхронизируем UI с реально используемым периодом.
+            self.after(0, lambda: self.period_var.set(schedule.period))
 
             results = []
             run_error: Exception | None = None
