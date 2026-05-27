@@ -44,6 +44,25 @@ def _bars_date_key(modal_title: str) -> str:
     return f"{int(m.group(1)):02d}.{int(m.group(2)):02d}"
 
 
+# «Стоп-слова» — мало информативны для определения схожести темы.
+_STOPWORDS = frozenset({
+    "и", "в", "на", "по", "к", "для", "из", "от", "до", "о", "об", "при",
+    "теме", "тема", "том", "та", "те", "тот", "это", "эти", "так", "как",
+    "что", "не", "ни", "за",
+})
+
+
+def _topic_words(s: str) -> set[str]:
+    """Значащие слова темы (>2 букв, без стоп-слов и пунктуации)."""
+    tokens = re.findall(r"[\wёЁ]+", (s or "").lower())
+    return {t for t in tokens if len(t) > 2 and t not in _STOPWORDS}
+
+
+def _has_common_words(a: str, b: str, min_words: int = 2) -> bool:
+    """True, если у тем есть хотя бы `min_words` общих значащих слов."""
+    return len(_topic_words(a) & _topic_words(b)) >= min_words
+
+
 @dataclass
 class FillResult:
     topic: str
@@ -316,13 +335,6 @@ class BarsClient:
             if not prev_hw and new_hw:
                 targets[key] = l
 
-        # Доп. индекс: дата (DD.MM) → список уроков. Используется как fallback,
-        # если тема в БАРС читается чуть-чуть иначе, чем в Excel.
-        by_date: dict[str, list[Lesson]] = {}
-        for l in schedule.lessons:
-            dkey = _excel_date_key(l.date_hint)
-            if dkey:
-                by_date.setdefault(dkey, []).append(l)
         already_done: set[str] = set()
 
         headers = self._lesson_column_headers()
@@ -352,38 +364,32 @@ class BarsClient:
                 self._close_lesson_modal()
                 continue
 
-            self.log(f"  [колонка {idx}] тема в БАРС: {topic[:80]!r}")
+            self.log(f"  [колонка {idx}] тема в БАРС: {topic!r}")
             key = normalize_topic(topic)
             lesson = targets.get(key)
-
-            # Date-fallback: если тема не нашлась, но есть уникальный урок Excel
-            # на эту же дату с непустым ДЗ — используем его.
-            if lesson is None:
-                bars_dkey = self._read_lesson_modal_date()
-                if bars_dkey:
-                    candidates = [
-                        c for c in by_date.get(bars_dkey, [])
-                        if (c.homework or "").strip()
-                        and normalize_topic(c.topic) not in already_done
-                    ]
-                    if len(candidates) == 1:
-                        lesson = candidates[0]
-                        key = normalize_topic(lesson.topic)
-                        self.log(
-                            f"    match по дате {bars_dkey} → "
-                            f"Excel-тема: {lesson.topic[:60]!r}"
-                        )
 
             if lesson is None:
                 if not topic:
                     self.log("    тема пустая (нет привязки к КТП) → пропуск")
                 else:
-                    self.log("    тема не из Excel → not_found")
-                    if not diag_shown:
+                    bars_dkey = self._read_lesson_modal_date()
+                    date_note = f" (БАРС-дата: {bars_dkey})" if bars_dkey else ""
+                    self.log(f"    тема не из Excel → not_found{date_note}")
+                    # Конкретная диагностика: ищем похожие темы в Excel,
+                    # чтобы пользователь увидел расхождение.
+                    similar = [
+                        ekey for ekey in targets
+                        if _has_common_words(ekey, key, min_words=2)
+                    ]
+                    if similar:
+                        self.log("    [diag] похожие темы в Excel:")
+                        for ekey in similar[:5]:
+                            self.log(f"    [diag]   {ekey!r}")
+                    elif not diag_shown:
                         diag_shown = True
-                        self.log("    [diag] список Excel-тем (для сравнения):")
+                        self.log("    [diag] полный список Excel-тем:")
                         for ekey in list(targets)[:30]:
-                            self.log(f"    [diag]   {ekey[:80]!r}")
+                            self.log(f"    [diag]   {ekey!r}")
                 self._close_lesson_modal()
                 continue
             if key in already_done:
