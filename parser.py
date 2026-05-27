@@ -126,7 +126,14 @@ def _parse_lessons(
             homework = None
         else:
             cleaned = _clean(raw_hw)
-            homework = cleaned if cleaned else None
+            # "нет", "—", "-", "нет задания" и т.п. = ДЗ не задано.
+            if not cleaned or re.match(
+                r"^(нет(\s+дз|\s+задания)?|no|none|[-–—])$",
+                cleaned, re.IGNORECASE
+            ):
+                homework = None
+            else:
+                homework = cleaned
         lessons.append(Lesson(date_hint=date_hint, topic=topic, homework=homework))
     return lessons
 

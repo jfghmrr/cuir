@@ -875,43 +875,91 @@ class BarsClient:
             pass
         return True
 
+    def _find_add_homework_button(self):
+        """Ищет кнопку «Добавить основное задание» с поллингом до 5 секунд.
+
+        Возвращает (locator_element | None). None означает, что кнопки нет
+        (ДЗ уже есть или вкладка не загрузилась совсем).
+        """
+        assert self.page is not None
+        page = self.page
+        deadline = time.monotonic() + 5.0
+        while True:
+            # Сначала ищем внутри видимого tabpanel (скоуп), потом глобально.
+            for loc in (
+                page.locator("[role='tabpanel']:visible").last.get_by_role(
+                    "button", name="Добавить основное задание", exact=True
+                ),
+                page.get_by_role("button", name="Добавить основное задание", exact=True),
+            ):
+                try:
+                    if loc.count() > 0 and loc.first.is_visible():
+                        return loc.first
+                except Exception:
+                    pass
+            if time.monotonic() >= deadline:
+                return None
+            try:
+                page.wait_for_timeout(300)
+            except Exception:
+                return None
+
+    def _log_tab_buttons(self) -> None:
+        """Диагностика: какие кнопки видны на странице (для отладки «кнопка не найдена»)."""
+        assert self.page is not None
+        page = self.page
+        try:
+            buttons = page.get_by_role("button").all()
+            visible_texts = []
+            for btn in buttons:
+                try:
+                    if btn.is_visible():
+                        visible_texts.append((btn.text_content() or "").strip()[:60])
+                except Exception:
+                    pass
+            self.log(f"    [diag] видимые кнопки: {visible_texts[:10]}")
+        except Exception:
+            pass
+
     def _add_next_lesson_homework(self, homework: str) -> tuple[str, str]:
         """Переключает на вкладку «Задание на следующий урок» и добавляет ДЗ.
 
         Идемпотентность: если кнопка «Добавить основное задание» disabled или
-        не видна — задание уже есть (БАРС держит кнопку видимой, но серой,
-        когда есть основное задание из КТП или добавленное вручную).
+        не найдена за 5 с — задание уже есть (или вкладка не загрузилась).
         Закрытие модалки урока — снаружи, через _save_and_close_lesson().
         """
         assert self.page is not None
         page = self.page
-        page.get_by_role("tab", name="Задание на следующий урок", exact=True).click()
+
+        # Кликаем по вкладке. Проверяем, что она существует.
+        hw_tab = page.get_by_role("tab", name="Задание на следующий урок", exact=True)
+        if hw_tab.count() == 0:
+            self.log("    [diag] вкладка «Задание на следующий урок» не найдена")
+            self._log_tab_buttons()
+            return "skipped_existing", "вкладка ДЗ не найдена"
+        hw_tab.first.click()
+        # Явное ожидание после клика: вкладка рендерится асинхронно.
+        page.wait_for_timeout(600)
         try:
             page.wait_for_load_state("networkidle", timeout=5_000)
         except PWTimeout:
             pass
 
-        # Скоупим в активную панель вкладки, чтобы не цеплять «Виды работ»
-        # и «Задание на текущий урок» с других вкладок/секций.
-        panel = page.locator("[role='tabpanel']:visible").last
-        add_btn = panel.get_by_role("button", name="Добавить основное задание", exact=True)
-        if add_btn.count() == 0 or not add_btn.first.is_visible():
-            global_add = page.get_by_role(
-                "button", name="Добавить основное задание", exact=True
-            )
-            if global_add.count() == 0 or not global_add.first.is_visible():
-                return "skipped_existing", "ДЗ уже есть (кнопка добавления не видна)"
-            add_btn = global_add
+        # Ищем кнопку «Добавить основное задание» с поллингом до 5 секунд.
+        add_btn = self._find_add_homework_button()
+        if add_btn is None:
+            self._log_tab_buttons()
+            return "skipped_existing", "ДЗ уже есть (кнопка добавления не появилась за 5 с)"
 
         # Если кнопка disabled — БАРС не даст добавить (есть КТП или уже было).
-        if self._is_button_disabled(add_btn.first):
+        if self._is_button_disabled(add_btn):
             return "skipped_existing", "ДЗ уже есть (кнопка добавления неактивна)"
 
         if self.dry_run:
             self.log(f"    [DRY] would add homework: {homework!r}")
             return "filled", f"[DRY] would fill: {homework!r}"
 
-        add_btn.first.click()
+        add_btn.click()
         page.wait_for_timeout(500)
 
         # БАРС мог показать алерт сразу после клика.
