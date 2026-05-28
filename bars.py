@@ -855,33 +855,58 @@ class BarsClient:
     def _dismiss_existing_homework_alert(self) -> bool:
         """Закрывает алерт «Уже добавлено основное задание...» если он появился.
 
-        Возвращает True, если алерт был и был закрыт (значит ДЗ уже есть).
+        Возвращает True, если алерт был обнаружен и закрыт (ДЗ уже есть).
+
+        ВАЖНО: ищем алерт ТОЛЬКО внутри popup-элементов
+        (role='alertdialog', .el-message-box, [class*='message-box'] и т.п.) —
+        иначе слово «уже добавлено» в обычном тексте страницы (заголовок
+        секции, инфо-надпись) будет ложно засчитан как алерт.
         """
         assert self.page is not None
         page = self.page
-        try:
-            alert = page.get_by_text(
-                re.compile(r"уже\s+добавлено|задание\s+из\s+ктп", re.IGNORECASE)
-            )
-            if alert.count() == 0 or not alert.first.is_visible():
-                return False
-        except Exception:
-            return False
-        # Закрываем — кнопка ОК или крестик модалки.
-        for name in ("OK", "ОК", "Ок", "Закрыть"):
+
+        # Только реальные popup-контейнеры.
+        scopes = [
+            "[role='alertdialog']:visible",
+            ".el-message-box:visible",
+            ".el-message:visible",
+            ".el-notification:visible",
+            "[class*='message-box']:visible",
+            "[class*='MessageBox']:visible",
+            "[class*='alert-dialog']:visible",
+        ]
+        alert_re = re.compile(r"уже\s+добавлено", re.IGNORECASE)
+
+        for sel in scopes:
             try:
-                btn = page.get_by_role("button", name=name, exact=True)
-                if btn.count() > 0 and btn.first.is_visible():
-                    btn.first.click()
-                    page.wait_for_timeout(300)
-                    return True
+                scope = page.locator(sel)
+                for el in scope.all():
+                    try:
+                        if not el.is_visible():
+                            continue
+                        txt = (el.text_content() or "")
+                        if not alert_re.search(txt):
+                            continue
+                        # Алерт реальный — закрываем через кнопку или ESC.
+                        for name in ("OK", "ОК", "Ок", "Закрыть", "Понятно"):
+                            try:
+                                btn = el.get_by_role("button", name=name, exact=True)
+                                if btn.count() > 0 and btn.first.is_visible():
+                                    btn.first.click()
+                                    page.wait_for_timeout(300)
+                                    return True
+                            except Exception:
+                                continue
+                        try:
+                            page.keyboard.press("Escape")
+                        except Exception:
+                            pass
+                        return True
+                    except Exception:
+                        continue
             except Exception:
                 continue
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
-        return True
+        return False
 
     def _find_add_homework_button(self, max_wait_s: float = 8.0):
         """Ищет кнопку «Добавить основное задание» с поллингом до max_wait_s.
@@ -1164,8 +1189,16 @@ class BarsClient:
         add_btn.click()
         page.wait_for_timeout(500)
 
-        # БАРС мог показать алерт сразу после клика.
+        # БАРС мог показать алерт сразу после клика. Перед закрытием делаем
+        # скриншот, чтобы можно было верифицировать, что алерт действительно
+        # есть (а не ложное срабатывание детектора).
         if self._dismiss_existing_homework_alert():
+            try:
+                shot_path = config.PROJECT_ROOT / f"diag_alert_{int(time.time())}.png"
+                page.screenshot(path=str(shot_path), full_page=False)
+                self.log(f"    [diag] алерт «уже добавлено» — скриншот: {shot_path.name}")
+            except Exception:
+                pass
             return "skipped_existing", "БАРС: задание уже добавлено (сразу)"
 
         # Открылся диалог «Добавление основного задания на следующий урок».
