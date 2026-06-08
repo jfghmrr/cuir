@@ -126,14 +126,10 @@ def _parse_lessons(
             homework = None
         else:
             cleaned = _clean(raw_hw)
-            # "нет", "—", "-", "нет задания", "не задано", "не задан[ы]" = ДЗ не задано.
-            if not cleaned or re.match(
-                r"^(нет(\s+дз|\s+задания)?|не\s+задан[оаы]?|no|none|[-–—])$",
-                cleaned, re.IGNORECASE
-            ):
-                homework = None
-            else:
-                homework = cleaned
+            # Любой непустой текст в Excel — это ДЗ (включая «нет», «не задано»
+            # и т.п. — учитель явно так написал, заливаем как есть).
+            # None только для реально пустых ячеек.
+            homework = cleaned if cleaned else None
         lessons.append(Lesson(date_hint=date_hint, topic=topic, homework=homework))
     return lessons
 
