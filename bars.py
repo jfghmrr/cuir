@@ -1206,13 +1206,148 @@ class BarsClient:
         except Exception as exc:
             self.log(f"    [diag] не удалось сохранить скриншот: {exc}")
 
+    def _find_existing_homework_row(self):
+        """Ищет существующую строку ДЗ в таблице на вкладке «Задание на следующий урок».
+
+        Возвращает (element | None) — реальную строку с данными (не заголовок).
+        """
+        assert self.page is not None
+        page = self.page
+        try:
+            panel = page.locator("[role='tabpanel']:visible").last
+        except Exception:
+            return None
+        # Ищем строку в таблице с данными — пропускаем заголовок.
+        for sel in (
+            "table tbody tr",
+            "[role='row']",
+            "[class*='table'] [class*='row']",
+        ):
+            try:
+                rows = panel.locator(sel).all()
+            except Exception:
+                continue
+            for row in rows:
+                try:
+                    if not row.is_visible():
+                        continue
+                    txt = (row.text_content() or "").strip()
+                    if not txt:
+                        continue
+                    # Заголовок таблицы: «Задание Вид задания Время на выполнение …».
+                    if re.match(r"^\s*Задание\s+Вид\s+задания", txt, re.IGNORECASE):
+                        continue
+                    # Строка с реальным содержимым (текст + есть ячейка)
+                    if len(txt) >= 3:
+                        return row
+                except Exception:
+                    continue
+        return None
+
+    def _overwrite_existing_homework(self, row, homework: str) -> tuple[str, str]:
+        """Переписывает существующее ДЗ через двойной клик по строке
+        (или клик по карандашу как fallback).
+
+        Возвращает (status, note).
+        """
+        assert self.page is not None
+        page = self.page
+
+        # Стратегия 1: двойной клик по строке — обычно открывает редактор.
+        try:
+            row.dblclick()
+            page.wait_for_timeout(800)
+        except Exception as exc:
+            self.log(f"    ! dblclick по строке не удался: {exc}")
+
+        # Открылся ли диалог редактирования?
+        dialog_open = False
+        try:
+            dlg = page.locator("[role='dialog']:visible, .el-dialog:visible")
+            if dlg.count() > 0 and dlg.first.is_visible():
+                dialog_open = True
+        except Exception:
+            pass
+
+        # Стратегия 2: если диалог не открылся — клик по строке + карандаш.
+        if not dialog_open:
+            try:
+                row.click()
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+            # Карандаш = иконка «edit»/«border_color» в правом верхнем углу.
+            pencil_candidates = [
+                page.get_by_role("button", name=re.compile(
+                    r"изменить|редактировать|edit", re.IGNORECASE
+                )),
+                page.locator(
+                    "[role='tabpanel']:visible button:has-text('edit'), "
+                    "[role='tabpanel']:visible button:has-text('border_color'), "
+                    "[role='tabpanel']:visible [aria-label*='Изменить'], "
+                    "[role='tabpanel']:visible [aria-label*='Редактировать']"
+                ),
+            ]
+            for cand in pencil_candidates:
+                try:
+                    for el in cand.all():
+                        try:
+                            if not el.is_visible():
+                                continue
+                            el.click()
+                            page.wait_for_timeout(800)
+                            dialog_open = True
+                            break
+                        except Exception:
+                            continue
+                    if dialog_open:
+                        break
+                except Exception:
+                    continue
+
+        if not dialog_open:
+            try:
+                shot_path = config.PROJECT_ROOT / f"diag_no_edit_{int(time.time())}.png"
+                page.screenshot(path=str(shot_path), full_page=False)
+                self.log(f"    [diag] редактор не открылся — скриншот: {shot_path.name}")
+            except Exception:
+                pass
+            return "skipped_existing", "ДЗ уже есть, но не удалось открыть редактор"
+
+        # Заполняем поле и сохраняем.
+        try:
+            self._fill_homework_input(homework)
+        except Exception as exc:
+            self.log(f"    ! не удалось вписать в редактор: {exc}")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return "skipped_existing", f"ошибка ввода: {exc}"
+
+        if not self._click_dialog_save():
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return "skipped_existing", "не нашёл «Сохранить» в редакторе ДЗ"
+
+        page.wait_for_timeout(500)
+        # БАРС может всё равно вернуть алерт — закрываем.
+        self._dismiss_existing_homework_alert()
+        try:
+            page.wait_for_load_state("networkidle", timeout=5_000)
+        except PWTimeout:
+            pass
+        return "filled", "переписано существующее ДЗ"
+
     def _add_next_lesson_homework(self, homework: str) -> tuple[str, str]:
         """Переключает на вкладку «Задание на следующий урок» и добавляет ДЗ.
 
-        Две модели UI:
-          A. БАРС показывает inline-редактор (contenteditable) сразу — заполняем.
-          B. БАРС требует клик «Добавить основное задание» — открываем диалог,
-             заполняем, сохраняем дочерний диалог.
+        Три модели UI:
+          A. inline-редактор (contenteditable) сразу на странице — заполняем.
+          C. в таблице уже есть строка с ДЗ — переписываем через dblclick/карандаш.
+          B. кнопка «Добавить основное задание» — открываем диалог, заполняем.
 
         Закрытие модалки урока — снаружи, через _save_and_close_lesson().
         """
@@ -1268,6 +1403,23 @@ class BarsClient:
                 self.log(f"    ! не удалось заполнить inline editor: {exc}")
                 # Падаем дальше — может, кнопка «Добавить» доступна.
 
+        # Модель C — на вкладке ДЗ уже есть строка в таблице (БАРС/КТП заполнил).
+        # Тогда нужно ПЕРЕПИСАТЬ, а не добавлять (БАРС иначе вернёт «уже добавлено»).
+        existing_row = self._find_existing_homework_row()
+        if existing_row is not None:
+            try:
+                existing_text = (existing_row.text_content() or "").strip()
+            except Exception:
+                existing_text = ""
+            # Если в строке уже наш текст — не трогаем.
+            if homework and homework.casefold() in existing_text.casefold():
+                return "skipped_existing", f"ДЗ совпадает: {existing_text[:40]!r}"
+            if self.dry_run:
+                self.log(f"    [DRY] would overwrite existing row → {homework!r}")
+                return "filled", f"[DRY] would overwrite: {homework!r}"
+            status, note = self._overwrite_existing_homework(existing_row, homework)
+            return status, note
+
         # Модель B — ищем кнопку «Добавить основное задание» до 8 секунд.
         add_btn = self._find_add_homework_button()
         if add_btn is None:
@@ -1294,6 +1446,11 @@ class BarsClient:
                 self.log(f"    [diag] алерт «уже добавлено» — скриншот: {shot_path.name}")
             except Exception:
                 pass
+            # Алерт есть → строка-то уже есть, пробуем переписать.
+            existing_row = self._find_existing_homework_row()
+            if existing_row is not None:
+                status, note = self._overwrite_existing_homework(existing_row, homework)
+                return status, note
             return "skipped_existing", "БАРС: задание уже добавлено (сразу)"
 
         # Открылся диалог «Добавление основного задания на следующий урок».
