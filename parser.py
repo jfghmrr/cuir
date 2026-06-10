@@ -52,7 +52,7 @@ class GroupSchedule:
     klass: str
     subject: str
     group: str
-    teacher: str
+    teacher: str = ""
     period: str = "2 Полугодие"
     lessons: list[Lesson] = field(default_factory=list)
 

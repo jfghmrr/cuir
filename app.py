@@ -40,6 +40,11 @@ class App(tk.Tk):
         self.group_var = tk.StringVar()
         self.period_var = tk.StringVar(value="2 Полугодие")
         self.dry_run_var = tk.BooleanVar(value=True)
+        # Массовая заливка: без Excel, во все колонки журнала — один и тот же
+        # текст ДЗ + tick «Урок проведен». Полезно для предметов вроде
+        # «Разговоры о важном», где ДЗ обычно «нет».
+        self.bulk_mode_var = tk.BooleanVar(value=False)
+        self.bulk_homework_var = tk.StringVar(value="нет")
 
         self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.confirm_event = threading.Event()
@@ -121,6 +126,17 @@ class App(tk.Tk):
             bg=BG, fg=FG, activebackground=BG, activeforeground=FG,
             selectcolor=BG, highlightthickness=0,
         ).grid(row=2, column=0, columnspan=4, sticky="w", padx=4, pady=4)
+        tk.Checkbutton(
+            meta,
+            text="Массовая заливка: без Excel, во все уроки залить один и тот же текст",
+            variable=self.bulk_mode_var,
+            bg=BG, fg=FG, activebackground=BG, activeforeground=FG,
+            selectcolor=BG, highlightthickness=0,
+        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=4, pady=4)
+        lbl(meta, "Текст ДЗ для всех уроков:").grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        entry(meta, self.bulk_homework_var, 40).grid(
+            row=4, column=1, columnspan=3, sticky="we", padx=4
+        )
         meta.columnconfigure(3, weight=1)
 
         btns = tk.Frame(self, bg=BG)
@@ -178,10 +194,27 @@ class App(tk.Tk):
     def _start(self) -> None:
         if self.worker and self.worker.is_alive():
             return
-        path = self.file_var.get().strip()
-        if not path or not Path(path).exists():
-            messagebox.showwarning("Нет файла", "Сначала выберите Excel-файл.")
-            return
+        bulk = self.bulk_mode_var.get()
+        if bulk:
+            # В режиме массовой заливки Excel не нужен — проверяем метаданные.
+            if not all([
+                self.klass_var.get().strip(),
+                self.subject_var.get().strip(),
+                self.group_var.get().strip(),
+                self.period_var.get().strip(),
+                self.bulk_homework_var.get().strip(),
+            ]):
+                messagebox.showwarning(
+                    "Не все поля заполнены",
+                    "Для массовой заливки укажите Класс, Предмет, Группу, Период "
+                    "и Текст ДЗ.",
+                )
+                return
+        else:
+            path = self.file_var.get().strip()
+            if not path or not Path(path).exists():
+                messagebox.showwarning("Нет файла", "Сначала выберите Excel-файл.")
+                return
         self.start_btn.config(state="disabled")
         self.confirm_event.clear()
         self.worker = threading.Thread(target=self._run, daemon=True)
@@ -197,30 +230,48 @@ class App(tk.Tk):
 
     def _run(self) -> None:
         try:
-            schedule = excel_parser.parse(self.file_var.get())
-            schedule.klass = self.klass_var.get().strip() or schedule.klass
-            schedule.subject = self.subject_var.get().strip() or schedule.subject
-            schedule.group = self.group_var.get().strip() or schedule.group
-
-            # Период: если пользователь ввёл четверть (например «4 четверть»),
-            # БАРС покажет только уроки той четверти, а Excel почти всегда содержит
-            # всё полугодие → большинство уроков уйдёт в not_found. Автоматически
-            # расширяем до полугодия (которое угадал парсер по датам Excel).
-            user_period = self.period_var.get().strip()
-            guessed = schedule.period  # _guess_period: «1 Полугодие» или «2 Полугодие»
-            if not user_period:
-                schedule.period = guessed
-            elif "четверт" in user_period.lower():
-                self._log(
-                    f"Период {user_period!r} заменён на {guessed!r} — БАРС с фильтром "
-                    "по четверти не покажет все уроки Excel.",
-                    "warn",
+            bulk_mode = self.bulk_mode_var.get()
+            if bulk_mode:
+                # Без Excel: schedule собираем из полей формы.
+                schedule = excel_parser.GroupSchedule(
+                    klass=self.klass_var.get().strip(),
+                    subject=self.subject_var.get().strip(),
+                    group=self.group_var.get().strip(),
+                    period=self.period_var.get().strip() or "2 Полугодие",
                 )
-                schedule.period = guessed
+                bulk_homework = self.bulk_homework_var.get().strip()
+                self._log(
+                    f"[массовая заливка] класс={schedule.klass!r}, "
+                    f"предмет={schedule.subject!r}, группа={schedule.group!r}, "
+                    f"период={schedule.period!r}, текст ДЗ={bulk_homework!r}",
+                    "info",
+                )
             else:
-                schedule.period = user_period
-            # Синхронизируем UI с реально используемым периодом.
-            self.after(0, lambda: self.period_var.set(schedule.period))
+                schedule = excel_parser.parse(self.file_var.get())
+                schedule.klass = self.klass_var.get().strip() or schedule.klass
+                schedule.subject = self.subject_var.get().strip() or schedule.subject
+                schedule.group = self.group_var.get().strip() or schedule.group
+
+                # Период: если пользователь ввёл четверть (например «4 четверть»),
+                # БАРС покажет только уроки той четверти, а Excel почти всегда содержит
+                # всё полугодие → большинство уроков уйдёт в not_found. Автоматически
+                # расширяем до полугодия (которое угадал парсер по датам Excel).
+                user_period = self.period_var.get().strip()
+                guessed = schedule.period
+                if not user_period:
+                    schedule.period = guessed
+                elif "четверт" in user_period.lower():
+                    self._log(
+                        f"Период {user_period!r} заменён на {guessed!r} — БАРС с фильтром "
+                        "по четверти не покажет все уроки Excel.",
+                        "warn",
+                    )
+                    schedule.period = guessed
+                else:
+                    schedule.period = user_period
+                # Синхронизируем UI с реально используемым периодом.
+                self.after(0, lambda: self.period_var.set(schedule.period))
+                bulk_homework = None
 
             results = []
             run_error: Exception | None = None
@@ -239,7 +290,10 @@ class App(tk.Tk):
                     )
                     try:
                         client.open_journal(schedule)
-                        results = client.fill_homework(schedule)
+                        if bulk_mode:
+                            results = client.fill_homework_bulk(bulk_homework)
+                        else:
+                            results = client.fill_homework(schedule)
                     except Exception as exc:
                         run_error = exc
                         self._log(f"Ошибка во время работы: {exc}", "err")

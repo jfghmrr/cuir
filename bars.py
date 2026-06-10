@@ -474,6 +474,101 @@ class BarsClient:
                 )
         return results
 
+    def fill_homework_bulk(self, homework_text: str) -> list[FillResult]:
+        """Массовая заливка: для ВСЕХ видимых колонок-уроков ставит галочку
+        «Урок проведен» и заливает один и тот же текст ДЗ. Без сопоставления
+        по Excel — обрабатываются все колонки подряд.
+
+        Используется для предметов вроде «Разговоры о важном», где ДЗ почти
+        всегда «нет» и удобнее заполнить разом.
+        """
+        assert self.page is not None
+        results: list[FillResult] = []
+
+        headers = self._lesson_column_headers()
+        self.log(
+            f"[массовая заливка] Найдено колонок в журнале: {len(headers)}; "
+            f"текст ДЗ: {homework_text!r}"
+        )
+
+        for idx in range(len(headers)):
+            current = self._lesson_column_headers_once()
+            if idx >= len(current):
+                break
+            try:
+                current[idx].click()
+            except Exception as exc:
+                self.log(f"  [колонка {idx}] не удалось открыть: {exc}")
+                continue
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=10_000)
+            except PWTimeout:
+                pass
+
+            try:
+                self._goto_lesson_tab()
+                topic = self._read_lesson_topic()
+            except Exception as exc:
+                self.log(f"  [колонка {idx}] не удалось прочитать тему: {exc}")
+                self._close_lesson_modal()
+                continue
+
+            self.log(f"  [колонка {idx}] тема в БАРС: {topic!r}")
+            date_hint = self._read_lesson_modal_date()
+            label = date_hint or topic[:30] or f"колонка {idx}"
+
+            marked_conducted = False
+            status = "skipped_no_homework"
+            note = ""
+
+            try:
+                try:
+                    marked_conducted = self._ensure_lesson_conducted()
+                    if marked_conducted:
+                        self.log(f"  ✓ {label} | tick «Урок проведен»")
+                    else:
+                        self.log(f"    {label} | галочка уже стояла")
+                except Exception as exc:
+                    self.log(f"  ! {label} | не удалось поставить галочку: {exc}")
+
+                status, note = self._add_next_lesson_homework(homework_text)
+                if status == "filled":
+                    self.log(f"    {label} | ДЗ добавлено: {homework_text!r}")
+                elif status == "skipped_existing":
+                    self.log(f"    {label} | ДЗ уже есть → пропуск")
+
+                if marked_conducted or status == "filled":
+                    if self._save_and_close_lesson():
+                        self.log(f"    {label} | сохранено")
+                    else:
+                        self.log("    fallback: «Сохранить и выйти» не найдена")
+                        self._close_lesson_modal()
+                else:
+                    self._close_lesson_modal()
+                    self.log(f"    {label} | закрыто без сохранения")
+
+                results.append(FillResult(
+                    topic=topic,
+                    date_hint=date_hint,
+                    homework=homework_text,
+                    status=status,
+                    note=note,
+                    marked_conducted=marked_conducted,
+                ))
+            except Exception as exc:
+                results.append(FillResult(
+                    topic=topic,
+                    date_hint=date_hint,
+                    homework=homework_text,
+                    status="error",
+                    note=str(exc),
+                    marked_conducted=marked_conducted,
+                ))
+                self.log(f"  ✗ {label} | ошибка: {exc}")
+                self._close_lesson_modal()
+
+        return results
+
     # ───────────── элементы интерфейса ─────────────
 
     # _LOCATORS_TODO: уточнить селекторы по реальной разметке БАРС.
